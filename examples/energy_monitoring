@@ -1,0 +1,904 @@
+#define ARDUINOJSON_USE_float 0
+
+#include <FS.h>                   //this needs to be first, or it all crashes and burns...
+#include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
+#include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
+#include <ArduinoJson.h>
+#include <PubSubClient.h>
+#include <ESP8266httpUpdate.h>
+#include <Arduino.h>
+#include <Ticker.h>
+Ticker tickerOSWatch;
+
+#include <DS3232RTC.h>        //http://github.com/JChristensen/DS3232RTC
+#include <Streaming.h> //http://arduiniana.org/libraries/streaming/
+#include <TimeLib.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+
+#define OSWATCH_RESET_TIME 600
+static unsigned long last_loop;
+String ret;
+const int chipSelect = 0;
+ int var = 0;
+  int reqLine = 2;
+File dataFile;
+
+WiFiEventHandler mDisConnectHandler;
+WiFiEventHandler mConnectHandler;
+
+void led_blink(int led);
+
+#define power_led 16
+#define wifi_ok 14
+#define data_ok 12
+#define tx_ok 13
+#define ti_reset 4   
+
+#define config_pin 5   
+
+char device_id[5] = "1027";
+int id = 1027;
+
+char passkey[5];
+char passkey_original[5] = "1234";
+char ver[3] = "1";
+String versi = "2.5";
+
+int wifiFailCount = 0;
+int serialFailCount = 0;
+int flashCount = 0;
+int tiLoginFail = 0;
+
+const char* mqtt_server = "mqtt.skiot.in";
+
+WiFiClient mqttClient, client1;
+PubSubClient pubsubclient(mqttClient);
+
+
+char api[65] = "f7d79ef9a199a588f14f032e3d7512b2e8b4c6fd06b1887eae0f2d48c1f46995";
+char ipp[26] = "mqtt.skiot.in:8081";
+
+char user[30] = "skiot.tech_df@gmail.com";
+char pass_key[30] = "passw0rd";
+String service_name = "skiot-mysql";
+String table_name = "node_data";
+
+String ap = "";
+String pass = "";
+float e1 = 0, e2 = 0, e3 = 0; //, energy_limit=0;
+
+char f = 0;
+
+bool shouldSaveConfig = false;
+unsigned int try_count = 0;
+unsigned int wifi_count = 0;
+unsigned int mqtt_count = 0;
+unsigned int mqtt_attempts = 3;
+
+float vrms_correct[3], irms_correct[3], act_power_correct[3], rec_power_correct[3], app_power_correct[3];
+float power_factor[3], frequency[3], Voltage_thd[3], current_thd[3];
+
+byte passwordValue[] = {0xfe, 0xfe, 0xfe, 0xfe, 0x68, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x68, 0x23, 0x0a, 0x60, 0x00, 0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0xde, 0x2b, 0x16};
+byte passwordValidation[] = {0xfe, 0xfe, 0xfe, 0xfe, 0x68};
+byte phase1Query_with_thd[] = {0xfe, 0xfe, 0xfe, 0xfe, 0x68, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x68, 0x23, 0x02, 0x61, 0x00, 0xec, 0x16};
+byte phase2Query_with_thd[] = {0xfe, 0xfe, 0xfe, 0xfe, 0x68, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x68, 0x23, 0x02, 0x62, 0x00, 0xed, 0x16};
+byte phase3Query_with_thd[] = {0xfe, 0xfe, 0xfe, 0xfe, 0x68, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99, 0x68, 0x23, 0x02, 0x63, 0x00, 0xee, 0x16};
+byte phase3Data[65], phase2Data[65], phase1Data[65];
+
+unsigned long current_time = 0, prev_time = 0;
+float duration;
+int perRestart = 20;
+char switch_flag;
+
+// For data over MQTT
+String sense_data;
+char sense_payload[1027];
+
+static volatile bool wifi_connected = false;
+
+WiFiManager wifiManager;
+void read_json(void) {
+  if (SPIFFS.begin()) {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r+");
+      if (configFile) {
+        Serial.println("opened config file");
+        size_t size = configFile.size();
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+
+        json.printTo(Serial);
+        if (json.success()) {
+          Serial.println("\n parsed json");
+          e1 = json["e1"];
+          e2 = json["e2"];
+          e3 = json["e3"];
+          strcpy(device_id, json["device_id"]);
+          switch_flag = json["switch_flag"];
+
+          json.printTo(Serial);
+          json.printTo(configFile);
+          configFile.close();
+
+        } else {
+          {
+            Serial.println("failed to load jsonconfig 1 ");
+            delay(1000);
+          }
+        }
+      }
+    }
+    SPIFFS.end();
+  } else {
+    flashCount = 0;
+    while (1) {
+      led_blink(power_led);
+      delay(100);
+      flashCount++;
+      if (flashCount > 10) {
+        ESP.restart();
+      }
+    }
+  }
+}
+void ICACHE_RAM_ATTR osWatch(void) {
+  unsigned long t = millis();
+  unsigned long last_run = abs(t - last_loop);
+  //  Serial.print("Ticker clock: ");
+  //  Serial.println(last_run);
+  if (last_run >= (OSWATCH_RESET_TIME * 1000)) {
+    // save the hit here to eeprom or to rtc memory if needed
+    Serial.println("Ticker Restart");
+    ESP.restart();  // normal reboot
+    //ESP.reset();  // hard reset
+  }
+}
+
+void setup() {
+    delay(5000);
+    pinMode(ti_reset, OUTPUT);
+    digitalWrite(ti_reset, LOW);
+    Serial.begin(9600);
+    Wire.begin(2,5);   //sda=2,scl=5
+    //setSyncProvider() causes the Time library to synchronize with the
+    //external RTC by calling RTC.get() every five minutes by default.
+    setSyncProvider(RTC.get);
+    Serial << F("RTC Sync");
+    if (timeStatus() != timeSet) Serial << F(" FAIL!");
+    Serial << endl;
+    /*RTC variable*/
+    static time_t tLast;
+    time_t t;
+    tmElements_t tm;
+
+ Serial.println("rtc is redy to take manual input ");
+   delay(10000);
+   
+    //check for input to set the RTC, minimum length is 12, i.e. yy,m,d,h,m,s
+    if (Serial.available() >= 12) {
+        //note that the tmElements_t Year member is an offset from 1970,
+        //but the RTC wants the last two digits of the calendar year.
+        //use the convenience macros from the Time Library to do the conversions.
+        int y = Serial.parseInt();
+        Serial.println(y);
+        if (y >= 100 && y < 1000){
+            Serial << F("Error: Year must be two digits or four digits!") << endl;
+            Serial.println("In rtc failed");
+        }
+        else {
+
+          Serial.println("In rtc setting ");
+            if (y >= 1000)
+                tm.Year = CalendarYrToTm(y);
+            else    //(y < 100)
+                tm.Year = y2kYearToTm(y);
+            tm.Month = Serial.parseInt();
+            tm.Day = Serial.parseInt();
+            tm.Hour = Serial.parseInt();
+            tm.Minute = Serial.parseInt();
+            tm.Second = Serial.parseInt();
+            t = makeTime(tm);
+            RTC.set(t);        //use the time_t value to ensure correct weekday is set
+            setTime(t);        
+            Serial << F("RTC set to: ");
+            printDateTime(t);
+            Serial << endl;
+        }
+    }
+    else{
+Serial.println("manual input is not given to the RTC!!!");
+}
+
+  last_loop = millis();
+  Serial.println("Enabling S/W Watchdog");
+  ESP.wdtEnable(4000);
+//  pinMode(ti_reset, OUTPUT);
+//  digitalWrite(ti_reset, LOW);
+  tickerOSWatch.attach_ms(((OSWATCH_RESET_TIME / 3) * 1000), osWatch);
+  pinMode(power_led, OUTPUT);
+  pinMode(wifi_ok, OUTPUT);
+  pinMode(data_ok, OUTPUT);
+  pinMode(tx_ok, OUTPUT);
+  pinMode(config_pin, INPUT);
+
+  digitalWrite(power_led, HIGH);
+  digitalWrite(wifi_ok, LOW);
+  digitalWrite(data_ok, LOW);
+  digitalWrite(tx_ok, LOW);
+  // Resetting the TI IC
+  delay(200);
+  digitalWrite(ti_reset, HIGH);
+
+  Serial.println("mounting FS...");
+
+
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  wifiManager.setTimeout(60);
+  Serial.print("Restart WIFI SSID: ");
+  Serial.println(WiFi.SSID());
+  ap = WiFi.SSID();
+  pass = WiFi.psk();
+  Serial.println(ap);
+  Serial.println(pass);
+
+  mDisConnectHandler = WiFi.onStationModeDisconnected(onDisconnect);
+  mConnectHandler = WiFi.onStationModeGotIP(onConnect);
+  if (config_pin == 1) {
+    if (!wifiManager.startConfigPortal("power_config_1027", "password")) {
+      Serial.println("failed to start config connect and hit timeout ********** ");
+    }
+  }
+  else {
+    if (!wifiManager.autoConnect("power_config_1027", "password")) {
+      Serial.println("failed to autoconnect connect and hit timeout ********** ");
+    }
+  }
+
+
+  if (shouldSaveConfig) {
+    ap = WiFi.SSID();
+    pass = WiFi.psk();
+  }
+  Serial.println(ap);
+  Serial.println(pass);
+  setup_wifi();
+
+  if (wifi_count > 24) {
+    Serial.println("WiFi Not Connected..... ");
+    Serial.println(ap);
+    Serial.println(pass);
+    digitalWrite(wifi_ok, LOW);
+  }
+  else {
+    digitalWrite(wifi_ok, HIGH);
+    Serial.print("connected to "); Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
+    Serial.println("local ip"); Serial.println(WiFi.localIP());
+    pubsubclient.setServer(mqtt_server, 8883);
+    pubsubclient.setCallback(callback);
+  }
+}
+
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+void led_blink(int led)
+{
+  digitalWrite(led, HIGH);
+  delay(200);
+  digitalWrite(led, LOW);
+}
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+void loop() {
+ static time_t tLast;
+    time_t t;
+    tmElements_t tm;
+    
+    t = now();
+    if (t != tLast) {
+        tLast = t;
+        
+        ret=printDateTime(t);
+        Serial.println(ret);
+        Serial << endl;
+    }
+
+  
+  perRestart--;
+  if (perRestart <= 0) {
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "PR");
+    }
+    ESP.restart();
+  }
+  last_loop = millis();
+  mqtt_handle();
+
+  led_blink(data_ok);
+  delay(200);
+  if (wifi_connected && pubsubclient.connected()) {
+    pubsubclient.publish("node/ack/1027", "ls");
+  }
+
+  boolean loggedIn = false;
+  for (int i = 0; i < sizeof(passwordValue) && !loggedIn; i++) {
+    Serial.write(passwordValue[i]);
+  }
+  int dataRxd = 0;
+  while (Serial.available() && !loggedIn) {
+    byte rxdData = Serial.read();
+    if (rxdData == passwordValidation[dataRxd]) {
+      dataRxd++;
+    }
+    if (dataRxd == 5) {
+      loggedIn = true;
+      Serial.print("Logged in successfully...");
+    }
+  }
+  if (wifi_connected && pubsubclient.connected()) {
+    pubsubclient.publish("node/ack/1027", "le");
+  }
+
+  Serial.flush();
+  tiLoginFail++;
+  if (tiLoginFail > 50) {
+    digitalWrite(power_led, HIGH);
+    delay(1000);
+    digitalWrite(power_led, LOW);
+    delay(1000);
+    digitalWrite(power_led, HIGH);
+    delay(1000);
+    digitalWrite(power_led, LOW);
+    ESP.restart();
+  }
+
+  mqtt_handle();
+
+  while (loggedIn) {
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "1s");
+    }
+
+    tiLoginFail = 0;
+    digitalWrite(data_ok, HIGH);
+    loggedIn = false;
+    //Phase 3 data
+    Serial.flush();
+    serialFlush();
+    // Querying phase 2 data
+    for (int i = 0; i < sizeof(phase3Query_with_thd); i++) {
+      Serial.write(phase3Query_with_thd[i]);
+    }
+    int rxdBytes3 = 0;
+    Serial.flush();
+    //Receiving phase 3 data
+    serialFailCount = 0;
+    while (!Serial.available()) {
+      delay(10);
+      serialFailCount++;
+      if (serialFailCount > 50) {
+        ESP.restart();
+      }
+    }
+    while (Serial.available()) {
+      rxdBytes3 = Serial.readBytes(phase3Data, 65);
+    }
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "1e");
+    }
+
+    delay(1000);
+    mqtt_handle();
+    //Phase 2 data
+    Serial.flush();
+    serialFlush();
+    // Querying phase 2 data
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "2s");
+    }
+
+    for (int i = 0; i < sizeof(phase2Query_with_thd); i++) {
+      Serial.write(phase2Query_with_thd[i]);
+    }
+    int rxdBytes2 = 0;
+    Serial.flush();
+    //Receiving phase 2 data
+    serialFailCount = 0;
+    while (!Serial.available()) {
+      delay(10);
+      serialFailCount++;
+      if (serialFailCount > 50) {
+        ESP.restart();
+      }
+    }
+    while (Serial.available()) {
+      rxdBytes2 = Serial.readBytes(phase2Data, 65);
+    }
+    delay(1000);
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "2e");
+    }
+
+    mqtt_handle();
+    // Phase 1 data
+    Serial.flush();
+    //    Serial.flush();
+    serialFlush();
+    // Querying phase 1 data
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "3s");
+    }
+
+    for (int i = 0; i < sizeof(phase1Query_with_thd); i++) {
+      Serial.write(phase1Query_with_thd[i]);
+    }
+    int rxdBytes1 = 0;
+    Serial.flush();
+    //Receiving phase 1 data
+    serialFailCount = 0;
+    while (!Serial.available()) {
+      delay(10);
+      serialFailCount++;
+      if (serialFailCount > 50) {
+        ESP.restart();
+      }
+    }
+    while (Serial.available()) {
+      rxdBytes1 = Serial.readBytes(phase1Data, 65);
+    }
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "3e");
+    }
+
+    delay(1000);
+
+    current_time = millis() / 1000.0 ;
+    sense_data = "1027|";
+
+
+    calculateParameters(phase1Data, 1);
+    calculateParameters(phase2Data, 2);
+    calculateParameters(phase3Data, 3);
+    digitalWrite(data_ok, LOW);
+
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "m1");
+    }
+
+    mqtt_handle();
+
+
+    send_web();
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "we");
+    }
+
+    mqtt_handle();
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "m2");
+    }
+
+  }
+  /************************************************************************************/
+    delay(10000);
+}
+String printDateTime(time_t t)
+{
+  String datetime = "";
+    datetime = printDate(t)+ ' ' + printTime(t);
+    return datetime;
+}
+
+//print time to Serial
+String printTime(time_t t)
+{
+  String time = "";
+    time = time + printI00(hour(t), ':');
+    time = time + printI00(minute(t), ':');
+    time = time + printI00(second(t), ' ');
+    return time;
+}
+
+//print date to Serial
+String printDate(time_t t)
+{
+  String date = "";
+    date = date + printI00(day(t), 0);
+    date = date + monthShortStr(month(t));
+    date = date + (year(t));
+    return date;
+}
+
+//Print an integer in "00" format (with leading zero),
+//followed by a delimiter character to Serial.
+//Input value assumed to be between 0 and 99.
+String printI00(int val, char delim)
+{
+  String I00 = "";
+    if (val < 10) I00 = I00 + '0';
+    I00 = I00 + ((val));
+    if (delim > 0) I00 = I00 + delim;
+    return I00;
+}
+//////////////////////////////////////////////////////////////////////////////
+
+void calculateParameters(byte data[65], int phase) {
+
+  float calibFactor = 100.0;
+
+  float vrms_temp = ((data[19] & 0xFF) << 24) | ((data[18] & 0xFF) << 16) | ((data[17] & 0xFF) << 8) | (data[16] & 0xFF);
+  vrms_temp = vrms_temp / calibFactor / 10;
+  vrms_correct[phase - 1] = vrms_temp * 2.37 / 2.35;
+
+  float irms_temp = ((data[23] & 0xFF) << 24) | ((data[22] & 0xFF) << 16) | ((data[21] & 0xFF) << 8) | (data[20] & 0xFF);
+  irms_temp = irms_temp / calibFactor / 10000;
+  irms_correct[phase - 1] = irms_temp * 1.25;
+
+  float active_power = ((data[27] & 0xFF) << 24) | ((data[26] & 0xFF) << 16) | ((data[25] & 0xFF) << 8) | (data[24] & 0xFF);
+  active_power = active_power / calibFactor / 10;
+  act_power_correct[phase - 1] = active_power * 1.25;
+
+  float reactive_power = ((data[31] & 0xFF) << 24) | ((data[30] & 0xFF) << 16) | ((data[29] & 0xFF) << 8) | (data[28] & 0xFF);
+  reactive_power = reactive_power / calibFactor / 10;
+  rec_power_correct[phase - 1] = reactive_power * 1.25;
+
+  float apparent_power = ((data[35] & 0xFF) << 24) | ((data[34] & 0xFF) << 16) | ((data[33] & 0xFF) << 8) | (data[32] & 0xFF);
+  apparent_power = apparent_power / calibFactor / 10;
+  app_power_correct[phase - 1] = apparent_power * 1.25;
+
+  int16_t power_factor_temp = ((data[37] & 0xFF) << 8) | (data[36] & 0xFF);
+  power_factor[phase - 1] = power_factor_temp / calibFactor / calibFactor;
+
+  float frequency_temp = ((data[39] & 0xFF) << 8) | (data[38] & 0xFF);;
+  frequency[phase - 1] = frequency_temp / calibFactor;
+
+  float Voltage_thd_temp = ((data[49] & 0xFF) << 8) | (data[48] & 0xFF);
+  Voltage_thd[phase - 1] = Voltage_thd_temp / 100;
+
+  float current_thd_temp = ((data[51] & 0xFF) << 8) | (data[50] & 0xFF);
+  current_thd[phase - 1] = current_thd_temp / 100;
+
+  sense_data = sense_data + String(vrms_correct[phase - 1]) + "|" + String(irms_correct[phase - 1]) + "|" + String(act_power_correct[phase - 1]) + "|" +
+               String(rec_power_correct[phase - 1])  + "|" + String(app_power_correct[phase - 1])  + "|" + String(power_factor[phase - 1])  + "|" +
+               String(frequency[phase - 1])  + "|" + String(Voltage_thd[phase - 1]) + "|" + String(current_thd[phase - 1]) + "|";
+}
+
+
+
+void serialFlush() {
+  while (Serial.available() > 0) {
+    char t = Serial.read();
+  }
+}
+
+void send_web(void)
+{
+  digitalWrite(tx_ok, HIGH);
+
+  Serial.println("Sending Data !!!");
+  if (wifi_connected && pubsubclient.connected()) {
+    pubsubclient.publish("node/ack/1027", "ws");
+  }
+  if (!wifi_connected || !pubsubclient.connected()) {
+    digitalWrite(wifi_ok, LOW);
+    Serial.println("... ");
+    duration = (float)(current_time - prev_time);
+
+    e1 = e1 + (duration * act_power_correct[0]) / 1000;
+    e2 = e2 + (duration * act_power_correct[1]) / 1000;
+    e3 = e3 + (duration * act_power_correct[2]) / 1000;
+    prev_time = current_time;
+    //    // save_json();
+
+
+  }
+  else {
+     
+    wifiFailCount = 0;
+    digitalWrite(wifi_ok, HIGH);
+    Serial.println(sense_data);
+    sense_data = sense_data + String(e1) + "|" + String(e2) + "|" + String(e3) + "|" + versi + "|" + ret + "|" + reqLine;
+
+
+
+pinMode(data_ok, INPUT);
+delay(100);
+write_sd();
+read_sd();
+pinMode(data_ok, OUTPUT);
+
+    
+    sense_data.toCharArray(sense_payload, 1027);
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/data/1027", sense_payload);
+      e1 = 0;
+      e2 = 0;
+      e3 = 0;
+      prev_time = current_time;
+      //      // save_json();
+    } else {
+      duration = (float)(current_time - prev_time);
+
+      e1 = e1 + (duration * act_power_correct[0]) / 1000;
+      e2 = e2 + (duration * act_power_correct[1]) / 1000;
+      e3 = e3 + (duration * act_power_correct[2]) / 1000;
+      prev_time = current_time;
+      // save_json();
+    }
+  }
+}
+
+//void update_energy(void)
+void save_json(void)
+{
+  Serial.println("saving json");
+  DynamicJsonBuffer jsonBuffer(400);
+  JsonObject& json = jsonBuffer.createObject();
+
+  json["device_id"] = atoi(device_id);
+  json["e1"] = e1;
+  json["e2"] = e2;
+  json["e3"] = e3;
+  json["switch_flag"] = switch_flag;
+
+  SPIFFS.begin();
+
+  File configFile = SPIFFS.open("/config.json", "w");
+  if (!configFile) {
+    flashCount = 0;
+    while (1) {
+      led_blink(power_led);
+      delay(200);
+      flashCount++;
+      Serial.println("failed to load jsonconfig e w ");
+      if (flashCount > 5) {
+        ESP.restart();
+      }
+    }
+  }
+  json.printTo(configFile);
+  configFile.close();
+
+  SPIFFS.end();
+}
+
+void setup_wifi(void)
+{
+  wifi_count = 0;
+  //  wifiManager.setTimeout(10);
+  if (!wifi_connected) {
+    digitalWrite(wifi_ok, LOW);
+    wifiFailCount++;
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_OFF);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ap.c_str(), pass.c_str());
+    Serial.print(ap.c_str());
+    Serial.print("Connecting to: ");
+    Serial.println(WiFi.SSID());
+  }
+
+  while (!wifi_connected && (wifi_count < 25)) {
+    led_blink(wifi_ok);
+    wifi_count++;
+    delay(500);
+    Serial.print(".");
+  }
+}
+
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  char ota_address[100];
+  int i;
+  Serial.print("Message arrived ["); Serial.print(topic); Serial.print("] ");
+  for (i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+    ota_address[i] = payload[i];
+  }
+  Serial.println();
+
+  ota_address[i] = '\0';
+
+  char a[10];
+
+
+  if (payload[0] == 48) { // ascii 0
+    switch_flag = 48;
+    snprintf (a, 10, "0");
+  }
+  else if (payload[0] == 49) {  // ascii 1
+    switch_flag = 49;
+    snprintf (a, 10, "1");
+  }
+  else if (payload[0] == 114) {  // ascii r
+    // save_json();
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "Restarting");
+    }
+
+    delay(1000);
+    ESP.restart();
+  }
+
+  else if (payload[0] == 104) { /*ascii h */
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.publish("node/ack/1027", "Updating");
+    }
+
+    Serial.println(String(ota_address));
+    t_httpUpdate_return ret = ESPhttpUpdate.update(client1, String(ota_address));
+
+    switch (ret) {
+      case HTTP_UPDATE_FAILED:
+        Serial.printf("HTTP_UPDATE_FAILD Error (%d): %s\n", ESPhttpUpdate.getLastError(), ESPhttpUpdate.getLastErrorString().c_str());
+        if (wifi_connected && pubsubclient.connected()) {
+          pubsubclient.publish("node/ack/1027", ESPhttpUpdate.getLastErrorString().c_str());
+        }
+
+        snprintf (a, 10, "1027_fail");
+        break;
+
+      case HTTP_UPDATE_NO_UPDATES:
+      if (wifi_connected && pubsubclient.connected()) {
+          pubsubclient.publish("node/ack/1027", "No Up" );
+        }
+        Serial.println("HTTP_UPDATE_NO_UPDATES");
+        snprintf (a, 10, "1027_noup");
+        break;
+
+      case HTTP_UPDATE_OK:
+      if (wifi_connected && pubsubclient.connected()) {
+          pubsubclient.publish("node/ack/1027", "Up Ok");
+        }
+        Serial.println("HTTP_UPDATE_OK");
+        snprintf (a, 10, "1027_ok");
+        break;
+    }
+  }
+  else {
+    if (switch_flag == 48) { // ascii 0
+      snprintf (a, 10, "0");
+    }
+    else if (switch_flag == 49) {  // ascii 1
+      snprintf (a, 10, "1");
+    }
+  }
+  if (wifi_connected && pubsubclient.connected()) {
+    pubsubclient.publish("node/ack/1027", a);
+  }
+
+  delay(100);
+
+}
+
+
+void mqtt_reconnect() {
+  mqtt_count = 0;
+  Serial.print("Attempting MQTT connection...");
+  while (wifi_connected && !pubsubclient.connected() && (mqtt_count < mqtt_attempts)) {
+    pubsubclient.setServer(mqtt_server, 8883);
+    pubsubclient.setCallback(callback);
+    mqtt_count++;
+    if (pubsubclient.connect("ESP8266Client_1027", "mqtt_skiot", "mqtt_skiot_password")) {
+      Serial.println("connected");
+      pubsubclient.subscribe("node/control/1027");
+      pubsubclient.subscribe("status/1027");
+
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(pubsubclient.state());
+      Serial.println("Attempting again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(1000);
+    }
+  }
+}
+
+void mqtt_handle() {
+
+  if (wifi_connected) {
+
+    if (wifi_connected && !pubsubclient.connected()) {
+      mqtt_reconnect();
+    }
+
+    if (wifi_connected && pubsubclient.connected()) {
+      pubsubclient.loop();
+    }
+    else {
+      Serial.println("couldn't connect to mqtt");
+    }
+  }
+}
+
+
+void onDisconnect(const WiFiEventStationModeDisconnected& event) {
+  Serial.println("Event::WiFi Not Connected...");
+  wifiFailCount++;
+  pubsubclient.disconnect();
+  wifi_connected = false;
+  if (wifiFailCount > 20) {
+    ESP.restart();
+  }
+}
+
+void onConnect(const WiFiEventStationModeGotIP& event) {
+  Serial.println("Event::WiFi Connected...");
+  wifiFailCount = 0;
+  wifi_connected = true;
+}
+
+
+
+
+void write_sd(void)
+{
+    Serial.print("Initializing SD card...");
+
+  // see if the card is present and can be initialized:
+  if (!SD.begin(chipSelect)) {
+    Serial.println("Card failed, or not present");
+    delay(1000);
+    // don't do anything more:
+    while (1);
+    }
+  Serial.println("card initialized.");
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  File dataFile = SD.open("datalog.txt", FILE_WRITE);
+
+  // if the file is available, write to it:
+  if (dataFile) {
+    dataFile.println(sense_data);
+    dataFile.close();
+    // print to the serial port too:
+    Serial.println(sense_data);
+  }
+  // if the file isn't open, pop up an error:
+  else {
+    Serial.println("error opening datalog.txt");
+  }
+}
+
+void read_sd(void)
+{
+  File dataFile = SD.open("datalog.txt");
+
+    // if the file is available, write to it:
+  if (dataFile) {
+    while (dataFile.available()) {
+      String list=dataFile.readStringUntil('\r');
+      Serial.println(list);
+      var++;
+      if(var==reqLine)
+      {
+        Serial.println(reqLine);
+      }
+      esle
+      {
+      break;
+      }
+      var=0;
+      Serial.write(dataFile.read());
+    }
+    dataFile.close();
+  }
+  // if the file isn't open, pop up an error:
+  else {
+    Serial.println("error opening datalog.txt");
+  }
+}
